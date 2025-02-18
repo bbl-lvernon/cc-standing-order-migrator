@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+      "baseUrl": "./src",
+      "module": "commonjs",
+      "esModuleInterop": true,
+      "target": "es6",
+      "moduleResolution": "node",
+      "allowSyntheticDefaultImports": true,
+      "sourceMap": true,
+      "outDir": "dist"
+    },
+    "lib": ["es2015"]
+  }
