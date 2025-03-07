@@ -1,40 +1,35 @@
-const moment = require ('moment');
-const winston = require('winston');
-const DailyRotateFile = require('winston-daily-rotate-file');
-import { commonConf } from '../config/common';
+import * as winston from 'winston';
+import DailyRotateFile from 'winston-daily-rotate-file';
 
-// Define custom format for logs
 const customFormat = winston.format.combine(
-  winston.format.splat(),
-  winston.format.simple(),
   winston.format.timestamp(),
   winston.format.align(),
-  winston.format.printf(info => `${moment().format('YYYY-MM-DD HH:mm:ss:SS')} - ${info.level} - ${info.message}`)
+  winston.format.printf(info => `${info.timestamp} [${info.level}]: ${info.message}`)
 );
 
-export class ApplicationLogger {
+// Configure transports first
+const transports = [
+  new DailyRotateFile({
+    filename: 'migrate-standins-orders-%DATE%.log',
+    datePattern: 'YYYY-MM-DD',
+    zippedArchive: true,
+    level: 'info'
+  }),
+  new winston.transports.Console({
+    level: 'info',
+    format: winston.format.combine(
+      winston.format.colorize(),
+      customFormat
+    )
+  })
+];
 
-    constructor(){}
-    
-    instiantiateLogger() {
-        // Instantiate loggers, rotate daily
-        winston.loggers.add('appLogger', {
-            exitOnError: false,
-            format: winston.format.combine(
-                customFormat
-            ),
-            transports: [
-                new DailyRotateFile({
-                    filename:  `${commonConf.logDir}${commonConf.logFile}-%DATE%.log`,
-                    datePattern: 'YYYY-MM-DD',
-                    zippedArchive: true,
-                    level: 'info'
-                }),
-                new winston.transports.Console({
-                    level: 'info'
-                })
-            ]
-        });
-    }
+// Create logger instance directly
+const logger = winston.createLogger({
+  level: 'info',
+  format: customFormat,
+  transports: transports,
+  exitOnError: false
+});
 
-}
+export default logger;

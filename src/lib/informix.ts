@@ -1,40 +1,67 @@
 "use strict";
-import { Database } from "ibm_db"; // Ensure you have ibm_db installed
-import dotenv from "dotenv";
-// Load environment variables globally
+
+//const ibmdb =  require('ibm_db');
+import * as ibmdb from 'ibm_db';
+// import * as bblmainConfig from '../config/bblmain-ifx.datasource.json';
+import dotenv from 'dotenv';
+// const dotenvExpand = require('dotenv-expand');
 dotenv.config();
+
+let connectionString: string;
+let db: ibmdb.Database;
+
+let bblmainConfig ={
+  "host": `${process.env.IFX_HOSTNAME}`,
+  "port": process.env.IFX_PORT,
+  "user": `${process.env.IFX_UID}`,
+  "password": `${process.env.IFX_PWD}`,
+  "database": `${process.env.IFX_DATABASE}`
+}
+
 export class bbankInformix {
-    connectionString: string = ``;
-
     constructor() {
-        // Constructing the Informix connection string
-        this.connectionString = `DATABASE=${process.env.DATABASE};HOSTNAME=${process.env.HOST};PORT=${process.env.PORT};UID=${process.env.UID};PWD=${process.env.PASS};INFORMIXSERVER=${process.env.INFORMIXSERVER};PRO=olsoctcp`;
+      // Initializaing connection to informix
+      connectionString = `DATABASE=${bblmainConfig.database};HOSTNAME=${bblmainConfig.host};PORT=${bblmainConfig.port};UID=${bblmainConfig.user};PWD=${bblmainConfig.password};PROTOCOL=TCPIP`;
+    }
+    
+    async openConnection() {
+      // opens a synchronous connection 
+      let dbConnected: any;
+      try{
+         console.log('Connection String: ' + connectionString);
+        db = ibmdb.openSync(connectionString);
+        dbConnected = db.connected;
+        console.log('Connection Opened... ');
+      } catch(err){
+        dbConnected = false;
+        console.log('There was an error opening the database connection: ' + err);
+      }
+      
+      return dbConnected;
     }
 
-    async executeQuery(sqlQuery: string): Promise<any> {
-        return new Promise((resolve, reject) => {
-            this.openConnection(this.connectionString).then((informixConn: any) => {
-                informixConn.query(sqlQuery).then(
-                    resp => resolve(resp),
-                    err => reject(err)
-                );
-            }).catch(err => reject(err));
-        });
+    // execute regular query
+    async executeQuery(sql: string) {
+      let data: any;
+      data = await db.query(sql);
+
+      return data;
     }
 
-    async openConnection(connectionString: string): Promise<any> {
-        return new Promise((resolve, reject) => {
-            const callback = (err: any, db: Database) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(db);
-                }
-            };
-            // Open Informix connection
-            const informix = require("ibm_db");
-            console.log('connectionString ' + JSON.stringify(this.connectionString));
-            informix.open(connectionString, callback);
-        });
+    // Can be used for UPDATE, INSERT and DELETE. Returns the number of rows affected
+    async executeNonQuery(sql: string): Promise<any> {
+      let data: any;
+      let statement = db.prepareSync(sql);
+      // data = statement.executeNonQuerySync();
+      data = await statement.executeNonQuery();
+
+      return data;
     }
+  
+    // close this connection when finished...
+    async closeConnection() {
+      ibmdb.close(db);
+      console.log('Informix Connection Closed...');
+    } 
+
 }
