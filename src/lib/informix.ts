@@ -43,8 +43,9 @@ export class bbankInformix {
     // execute regular query
     async executeQuery(sql: string) {
       let data: any;
+      console.log(`Running Sql... `+ JSON.stringify(sql));
       data = await db.query(sql);
-
+      console.log(`Result... `+ JSON.stringify(data));
       return data;
     }
 

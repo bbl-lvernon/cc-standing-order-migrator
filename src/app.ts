@@ -20,6 +20,7 @@ const ifx = new bbankInformix();
 export class StandingOrderMigration {
         private lineNo = 1;
     private orders;
+    private filteredOrders;
     private apiCallStatus;
 
     private today = new Date();
@@ -34,15 +35,14 @@ constructor() {}
       public async main():  Promise<void> {
         try{
         logger.info('------ cc-standing-order-migrator EXTRACT PROCESS STARTED ------');
-        logger.info('------ 1/2 loadOrders PROCESS STARTED                  ---------');
+        logger.info('------ 0/2 loadOrders PROCESS STARTED                  ---------');
         this.orders = await this.loadOrders();
         logger.info('------ 1/2 loadOrders PROCESS COMPLETED                ---------');
         const sent = await this.sendOrders(this.orders);
-        logger.info('------ 2/2 sendOrders complete                             -----');
+        logger.info('------ 2/2 sendOrders PROCESS COMPLETED                   -----');
         logger.info(`------ 2/2 ${sent}/${this.orders.length} standing orders sent to API for processing-----`);
         } catch(err){
             logger.error(`Program ending due to error`);
-            throw err;
         }  
 
     }
@@ -53,12 +53,14 @@ constructor() {}
         //  2. Process the query results and return the data as an array.
         const today = dayjs().format('YYYYMMDD')
         await ifx.openConnection();
-        const sql = `SELECT FIRST 10 ccardsitf.*, ccard3.ccardnameaddr 
+        const sql = `SELECT FIRST 50 ccardsitf.*, ccard3.ccardnameaddr 
         FROM ccardsitf
         LEFT JOIN ccard3 ON ccardsitf.ccardno = ccard3.ccardno
         WHERE startdate <= '${today}'  AND enddate >= '${today}'
         AND ccard3.ccardno IN (SELECT ccardno FROM ccard3 WHERE ccardstatus = 1)
-        AND ccardsitf.frequency = '4';`;
+        AND fbeaccount NOT LIKE ''
+        AND ccardtype = '42'`;//usd cards
+        //AND ccardsitf.frequency = '4'
 
         // const sql =`select ccard3.ccardno,ccardtype,fbeaccount,itfdategen,frequency,fixeddate,
         // amount,fixedamount, amountpercent, itferrdescri, ccard3.ccardnameaddr 
@@ -70,7 +72,7 @@ constructor() {}
         logger.info('Informix ccardsitf SQL QUERY: ' + sql);
             let sqlResult = await ifx.executeQuery(sql);
             logger.info(`------ 2/2 Number of Schedule Transfers Recieved : ${sqlResult.length} ---`);
-            await ifx.closeConnection();
+            //await ifx.closeConnection();
             return sqlResult;
         }catch(err){
          logger.error('Unable to retrieve database payload. \n' + err );
@@ -82,10 +84,172 @@ constructor() {}
         return dayjs(date, 'DD.MM.YYYY HH:mm:ss').format('YYYY-MM-DD HH:mm:ss');
       }
 
-   private async sendOrders(allOrders : any): Promise<void> {
+    private async sendOrders(allOrders){
+        let order;
+        let sent = 0;
+        let rejectedCards = 0;
+        let sentStatus;
+                   logger.info(`------ Sorting Personal/Corporate.... ---`);
+        for(order of allOrders){ 
+            try{
+            //first we will check if card is personal or coporate using the bin
+            logger.info(`BEGIN SO FILTER FOR CARD TYPE, CCARDNO: ` + order.ccardno );
+            let cardType = await this.categorizeCard(order);
+            if(cardType == 'Unknown'){
+                logger.warn(`Card Type unknown, skipping SO for card ` + order.ccardno);
+                rejectedCards = rejectedCards+1;
+                (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);  
+            }
+            else{
+            //second we will check if this card has a pcrn for this card number in the informix non financial table
+            const PcrnSql = `select primary_card_reference_number as pcrn, member_number as memberno from informix.non_financial_detail_i2c where card_number = '${order.ccardno}'`;
+            let hasPcrn = await ifx.executeQuery(PcrnSql);
+            logger.info(`------ pcrn first query result: ${JSON.stringify(hasPcrn)} ---`);
+            if(hasPcrn[0].pcrn || hasPcrn[0].pcrn != "")
+            {
+            //PCRN FOUND
+                    logger.info(`------ pcrn found on first query, re-querying the same table to find the real pcrn ---`);
+                    const realPcrnSql = `select primary_card_reference_number as pcrn, member_number as memberno from informix.non_financial_detail_i2c where card_number = '${hasPcrn}'`;
+                    let realPcrn = await ifx.executeQuery(realPcrnSql);
+                    if(!realPcrn.pcrn || realPcrn.length !> 0){
+                        logger.warn(`------Could not find a valid Primary Card Reference Number, skipping.`);
+                        rejectedCards = rejectedCards+1;
+                        (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);  
+                        break;  
+                    }
+                if(cardType == 'Corporate'){
+                    const queryOwner = `SELECT * FROM informix.ubtb_acctmandate WHERE UBCUSTOMERCODE = '${realPcrn[0].memberno}' AND UBACCOUNTID = '${order.fbeaccount}' AND UBROLE = 'OWNER'`;
+                    let owner = await ifx.executeQuery(queryOwner);
+                    //logger.info(`------ ran sql : ${queryOwner} with result: ${JSON.stringify(owner)} ---`);
+                    if(owner.length > 0) { //if owner is found, migrate this order
+                        logger.info(`------ found owner and sending order : ${JSON.stringify(order)}`);
+                        await this.sendOrder(order)
+                        sent = sent + 1;
+                        (sent % 1 === 0) && logger.info(`Transfers processed so far: ${sent}`);    
+                        
+                    }else{ //no owner found so skip
+                        logger.info(`------didnt find owner for card ${order.ccardno}, fbe account ${order.fbeaccount}, skipping`);
+                        rejectedCards = rejectedCards+1;
+                        (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);    
+                        
+                    }
+                }  else if(cardType == 'Personal'){
+                const queryOwner = `SELECT * FROM informix.ubtb_acctmandate WHERE UBCUSTOMERCODE = '${hasPcrn[0].memberno}' AND UBACCOUNTID = '${order.fbeaccount}' AND UBROLE IN ('OWNER', 'JOINTACHOLDER') `;
+                let owner = await ifx.executeQuery(queryOwner);
+                //logger.info(`------ ran sql : ${queryOwner} with result: ${JSON.stringify(owner)} ---`);
+                if(owner.length > 0) { //if owner is found, migrate this order
+                    logger.info(`------ found owner and sending order : ${JSON.stringify(order)}`);
+                    await this.sendOrder(order)
+                    sent = sent + 1;
+                    (sent % 1 === 0) && logger.info(`Transfers processed so far: ${sent}`);    
+
+                }else{ //no owner found so skip
+                    logger.info(`------didnt find owner for card ${order.ccardno}, fbe account ${order.fbeaccount}, skipping`);
+                    rejectedCards = rejectedCards+1;
+                    (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);    
+                    
+                }
+            }
+        }
+        else if(!hasPcrn[0].pcrn || hasPcrn[0].pcrn == "")
+        {            //NO PCRN FOUND / EMPTY / REAL OWNER FOUND
+            logger.info(`------ pcrn not found on first query, re-querying the same table not required ---`);
+            if(cardType == 'Corporate'){
+            const queryOwner = `SELECT * FROM informix.ubtb_acctmandate WHERE UBCUSTOMERCODE = '${hasPcrn[0].memberno}' AND UBACCOUNTID = '${order.fbeaccount}' AND UBROLE = 'OWNER'`;
+            let owner = await ifx.executeQuery(queryOwner);
+            //logger.info(`------ ran sql : ${queryOwner} with result: ${JSON.stringify(owner)} ---`);
+            if(owner.length > 0) { //if owner is found, migrate this order
+                logger.info(`------ found owner and sending order : ${JSON.stringify(order)}`);
+                await this.sendOrder(order);
+                sent = sent + 1;
+                (sent % 1 === 0) && logger.info(`Transfers processed so far: ${sent}`);    
+
+            }else{ //no owner found so skip
+                logger.info(`------didnt find owner for card ${order.ccardno}, fbe account ${order.fbeaccount}, skipping`);
+                rejectedCards = rejectedCards+1;
+                (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);    
+                
+            }
+        } else if(cardType == 'Personal'){
+            const queryOwner = `SELECT * FROM informix.ubtb_acctmandate WHERE UBCUSTOMERCODE = '${hasPcrn[0].memberno}' AND UBACCOUNTID = '${order.fbeaccount}' AND UBROLE IN ('OWNER', 'JOINTACHOLDER')`;
+            let owner = await ifx.executeQuery(queryOwner);
+            //logger.info(`------ ran sql : ${queryOwner} with result: ${JSON.stringify(owner)} ---`);
+            if(owner.length > 0) { //if owner is found, migrate this order
+                logger.info(`------ found owner and sending order : ${JSON.stringify(order)}`);
+                sentStatus = await this.sendOrder(order);
+                rejectedCards = rejectedCards+1;
+                (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);    
+                sent = sent + 1;
+                (sent % 1 === 0) && logger.info(`Transfers processed so far: ${sent}`);    
+
+            }else{ //no owner found so skip
+                logger.info(`------didnt find owner for card ${order.ccardno}, fbe account ${order.fbeaccount}, skipping`);
+                rejectedCards = rejectedCards+1;
+                (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);    
+            }
+        }            
+    }
+}
+}catch(err){
+        rejectedCards = rejectedCards++;
+        logger.error('Rejecting Card ' + order.ccardno+ ' Standing Order failed: '+ JSON.stringify(err));
+        } }
+    logger.info(`Total transfers processed ${sent+rejectedCards}, sent: ${sent}, rejected/failed`);   
+    logger.info(`Total transfers sent to i2c ` + sent);  
+    logger.info(`Total transfers failed ` + rejectedCards);   
+    }
+
+
+
+    private async categorizeCard(order): Promise<string | Error> {
+        let cardno = order.ccardno.toString(); // Ensure it's a string
+        const bin = cardno.substring(0, 8); // Extract first 8 digits
+        logger.info(`BIN is: ${bin}`); // Log BIN for debugging
+
+        const corporateBins: string[] = [
+            "51579301", // MasterCard AA Platinum Company
+            "5434641901", // MPL Platinum Company
+            "52554850", "52554860" // AA MasterCard Platinum Corporate
+        ];
+
+        const personalBins: string[] = [
+            // Visa Personal
+            "49166531", "458148000", "458148002", "458148003", "458148004", "458148005", "458148006", "458148007",
+
+            // MasterCard Standard Personal
+            "53395559",
+
+            // MasterCard AA Standard Personal
+            "55261101",
+
+            // MasterCard AA Platinum Personal
+            "51579300",
+
+            // AA MasterCard Platinum Personal
+            "52554852", "52554862",
+
+            // MPL Platinum Personal
+            "5434641903", "5434641904", "5434641900", "5434641906", "5434641907", "5434641908"
+        ];
+
+        if (corporateBins.includes(bin)) {
+            logger.info(`Card type was found to be C `);   
+            return "Corporate";
+        } else if (personalBins.includes(bin)) {
+            logger.info(`Card type was found to be P`);  
+            return "Personal";
+        } else {
+            logger.info(`Card type was found to be Unkown`);  
+            return "Unknown";
+        }
+}
+
+    
+    private async sendOrder(order : any) {
         logger.info('Sending Orders...');
 let sent : number = 0;
-        try{
+let failedCards: number = 0;
+
                 // Write header
                 
 
@@ -93,67 +257,62 @@ let sent : number = 0;
                 // Load customer information from the database
                 //logger.info('[ populateFile() ] stringified customerInfo: recieved' + JSON.stringify(allOrders));
                 // Populate file with data
-                for (const order of allOrders) {
+                //for (const order of allOrders) {
+
                     //Format data and write to file
                     //logger.info('Stringified info Object from Database: ' + JSON.stringify(order));
-                    logger.info(`currently Processing: ccardno: ${JSON.stringify(order.ccardno)}, frequency: ${JSON.stringify(order.frequency)}, amount: ${JSON.stringify(order.amount)} `);
+                    logger.info(`currently Processing: ccardno: ${JSON.stringify(order.ccardno)},order.fbeaccount: ${order.fbeaccount.toString()} frequency: ${JSON.stringify(order.frequency)}, amount: ${JSON.stringify(order.amount)} `);
                     //logger.info('literal info Object from Database: ' + order)
 
                     //let branch = await this.getSourceCode(order.BRANCHCODE),
     
                     //CUSTorder OBJECT
-                    let transferBody1 =  {
-                        bankAccount: order.fbeaccount,
+                    let transferBody =  {
+                        bankAccount: order.fbeaccount,//.toString(),
                         cardNumber: order.ccardno.toString(),  
-                        amount: await this.getAmount(order) || "", // Optional, depends on AmountPreference and Frequency conditions
+                        amountPreference: await this.getAmtPref(order), // Example: "L" (Optional)
+                        amount: await this.getAmount(order)|| 0,
                         comments: "Scheduled Credit Card Payment",  
                         transferFrequency: await this.getFrequency(order), // Example: "O" | "D" | "W" | "F" | "M" | "Q" | "B" | "Y" | "DT"
-                        transferDate: await this.getTransferDate(order), // Example: "2025-02-19" (Optional if one-time transfer)
                         transferContinuity: await this.getContinuity(order), // Example: "I" | "C" | "D" | "A"
-                        transferCount: "", // Example: "1" (Optional if TransferContinuity !== "D")
-                        transferEndDate: "", // Example: "2025-12-31" (Expiry date)
-                        amountPreference: await this.getAmtPref(order), // Example: "L" (Optional)
                         daysBeforeDueDate: await this.getDays(order), // Example: "15" (Mandatory ONLY if TransferContinuity = "I", range 0-31)
-                        thrshldLmtPrctge: "", // Example: "100" (Optional, percentage threshold limit)
-                        routingNumber: "437623092", // Example (Fixed routing number)
-                        accNickname: await this.sanitizeString(order.ccardnameaddr.split("#")[0].trim()), // Example (Unique, no spaces)
+                        routingNumber: "003006959",//order.ccardno.tostring, // Example (Fixed routing number)
+                        accNickname: await this.sanitizeString(order.ccardnameaddr.split("#")[0].trim()).slice(0, 16) + order.ccardno.slice(0, 4),
                         accType: await this.getAccType(order), //this.getAccType(order) Example: "01" | "11"
                         accTitle: order.ccardnameaddr.split("#")[0].trim(),
                         bankName: "BBL", // Example: "BELIZE BANK"
                         accNumber: order.fbeaccount,
-                        verifyAccountMigration: "Y"
+                        verifyAccountMigration: "Y",
+                        requiresVerification: "N"
                       }
-                      let transferBody = {
-                        bankAccount: "137125060230005",
-                        cardNumber: "5157930100010014",
-                        accountSrNo: "596000000000008867",
-                        amount: 10.00,
-                        comments: "Payment for services",
-                        transferFrequency: "M",
-                        transferDate: "02/28/2025",
-                        transferContinuity: "A",
-                        transferCount: "12",
-                        transferEndDate: "02/26/2026",
-                        transferAmount: 20,
-                        daysBeforeDueDate: 3,
-                        thrshldLmtPrctge: 10,
-                        routingNumber: "437623092",
-                        accNickname: "PersonalAccount123",
-                        accType: "11",
-                        accNumber: "137125010230005",
-                        accTitle: "John Doe",
-                        bankName: "Sample Bank",
-                        verifyAccountMigration: "Y"
-                        }
-
-                    await this.sendTransfer(transferBody);
-                    //every 500 display a log
-                    sent = sent + 1;
+                    //   let transferBody1 = {
+                    //     //bankAccount: "155304010230002",
+                    //     //4916653107949019 nellie, 5255486206517254 sheena, 
+                    //     bankAccount: "137125010230002",
+                    //     cardNumber: "4916653107949019",
+                    //     amount: 0.00,
+                    //     comments: "NEL STANDING ORDER TEST SH .00",
+                    //     transferFrequency: "M",
+                    //     transferContinuity: "I",
+                    //     amountPreference: "M",
+                    //     daysBeforeDueDate: "5",
+                    //     routingNumber: "003006959",
+                    //     accNickname: "NELCARDACC",
+                    //     accType: "11",
+                    //     accNumber: "137125010230002",
+                    //     accTitle: "NELACC",
+                    //     bankName: "BELIZEBANKLTD",
+                    //     verifyAccountMigration: "Y",
+                    //     requiresVerification: "N"
+                    //    }
                     console.log("transferBody :" + JSON.stringify(transferBody));
-                    (sent % 1 === 0) && logger.info(`Transfers sent so far: ${sent}`);            
-                }           
-                logger.info(`Total transfers sent ` + sent);   
-            }catch(err){logger.error('Unexpected system error in sendingOrders()'); throw err}
+                    try{
+                    let response = await this.sendTransfer(transferBody);
+                    return {status:0, message : response}}catch(err)
+                    {
+                        logger.error(`Transfers processed so far: ${sent}`);
+                        return {status: 1, message: err}  
+                    }
         }
 
     async getFrequency(order: any): Promise<string> {
@@ -165,14 +324,14 @@ let sent : number = 0;
         return (str ?? "").replace(/[\s,.:\"']/g, "");
     }
       
-    async getAmount(order: any) {
-        //logger.info(`order.amount : ${order.amount} , order.fixedamount : ${order.fixedamount}` );   
-        if (order.amount == "1" && order.fixedamount >= "0") { //1 = fixed amount
-            const amt = order.fixedamount.toString(); // Ensure it's a string
-            return amt;
-        } else {
-            return 0;
+    async getAmount(order: any): Promise<number> {
+        logger.info(`ATGETAMOUNT order.amount: ${order.amount}, order.fixedamount: ${order.fixedamount}`);
+    
+        if (order.amount === "1" && Number(order.fixedamount) >= 0) { // Ensure proper comparison
+            return Number(order.fixedamount); // Convert to a number before returning
         }
+    
+        return 0;
     }
     
 
@@ -188,8 +347,10 @@ let sent : number = 0;
         let pref
         if(order.amount == 1 && order.fixedamount >= 0){
             pref = "F"; //fixed amount
+            return pref;
         }else if(order.amount == 2 && order.fixedamount == 0){
             pref = "M"; //minimum payment
+            return pref;
         //}else if((order.amount == 3 || order.amount == 4) && order.fixedamount >= 0){
         }else if((order.amount == 3 || order.amount == 4) && order.amountpercent == 100){
             pref = "C"; // 100% of full/staement bal
@@ -241,16 +402,28 @@ let sent : number = 0;
             logger.info(`standing order body: `+JSON.stringify(body));
             // logger.info(`standing order headers:`+JSON.stringify(headers));
 
-            const response = await axios.post(url, body, { headers });
-    
-            logger.info(`API CALLED - Status: ${response.status}, returning Data: ${JSON.stringify(response.data)}`);
-            return response.data;
-        } catch (err) {
-            logger.error(`Error sending scheduled transfer API request: ${err.message} ${err.code} ${err.response.statusText} `);
-            throw err.code;
+
+                const response = await axios.post(url, body, { headers });
+            
+                logger.info(`API CALLED - Status: ${response.status}, returning Data: ${JSON.stringify(response.data)}`);
+                return response.data;
+            } catch (err) {
+                if (err.response) {
+                    const errorResponse = err.response.data;
+                    
+                    // Extract response details
+                    const cardNumber = body.cardNumber;  // Assuming the card number is in the request body
+                    const responseCode = errorResponse.getCardholderProfileResponse?.responseCode;
+                    const responseDesc = errorResponse.getCardholderProfileResponse?.responseDesc;
+            
+                    logger.error(`Error in API request: ${err.message} ${err.code} 
+                    Error Response: ${JSON.stringify(errorResponse)}`);
+                        logger.warn(`SO for Card ${cardNumber} failed: ${JSON.stringify(errorResponse)}`);
+                        throw errorResponse;
+                    }
+            }
         }
     }
-}
 
 let app = new StandingOrderMigration();
 app.main();
