@@ -40,7 +40,6 @@ constructor() {}
         logger.info('------ 1/2 loadOrders PROCESS COMPLETED                ---------');
         const sent = await this.sendOrders(this.orders);
         logger.info('------ 2/2 sendOrders PROCESS COMPLETED                   -----');
-        logger.info(`------ 2/2 ${sent}/${this.orders.length} standing orders sent to API for processing-----`);
         } catch(err){
             logger.error(`Program ending due to error`);
         }  
@@ -53,7 +52,7 @@ constructor() {}
         //  2. Process the query results and return the data as an array.
         const today = dayjs().format('YYYYMMDD')
         await ifx.openConnection();
-        const sql = `SELECT FIRST 50 ccardsitf.*, ccard3.ccardnameaddr 
+        const sql = `SELECT FIRST 30 ccardsitf.*, ccard3.ccardnameaddr 
         FROM ccardsitf
         LEFT JOIN ccard3 ON ccardsitf.ccardno = ccard3.ccardno
         WHERE startdate <= '${today}'  AND enddate >= '${today}'
@@ -177,8 +176,6 @@ constructor() {}
             if(owner.length > 0) { //if owner is found, migrate this order
                 logger.info(`------ found owner and sending order : ${JSON.stringify(order)}`);
                 sentStatus = await this.sendOrder(order);
-                rejectedCards = rejectedCards+1;
-                (sent % 1 === 0) && logger.info(`Transfers rejected so far: ${rejectedCards}`);    
                 sent = sent + 1;
                 (sent % 1 === 0) && logger.info(`Transfers processed so far: ${sent}`);    
 
@@ -194,9 +191,9 @@ constructor() {}
         rejectedCards = rejectedCards++;
         logger.error('Rejecting Card ' + order.ccardno+ ' Standing Order failed: '+ JSON.stringify(err));
         } }
-    logger.info(`Total transfers processed ${sent+rejectedCards}, sent: ${sent}, rejected/failed`);   
-    logger.info(`Total transfers sent to i2c ` + sent);  
-    logger.info(`Total transfers failed ` + rejectedCards);   
+    logger.info(`Total transfers processed ${sent+rejectedCards}, sent: ${sent}, rejected/failed: ${rejectedCards}`);   
+    // logger.info(`Total transfers sent to i2c ` + sent);  
+    // logger.info(`Total transfers failed ` + rejectedCards);   
     }
 
 
@@ -263,71 +260,73 @@ let failedCards: number = 0;
                     //logger.info('Stringified info Object from Database: ' + JSON.stringify(order));
                     logger.info(`currently Processing: ccardno: ${JSON.stringify(order.ccardno)},order.fbeaccount: ${order.fbeaccount.toString()} frequency: ${JSON.stringify(order.frequency)}, amount: ${JSON.stringify(order.amount)} `);
                     //logger.info('literal info Object from Database: ' + order)
-
+                    
                     //let branch = await this.getSourceCode(order.BRANCHCODE),
-    
+
+                    
                     //CUSTorder OBJECT
                     let transferBody =  {
                         bankAccount: order.fbeaccount,//.toString(),
                         cardNumber: order.ccardno.toString(),  
                         amountPreference: await this.getAmtPref(order), // Example: "L" (Optional)
-                        amount: await this.getAmount(order)|| 0,
+                        amount: await this.getAmount(order),
                         comments: "Scheduled Credit Card Payment",  
                         transferFrequency: await this.getFrequency(order), // Example: "O" | "D" | "W" | "F" | "M" | "Q" | "B" | "Y" | "DT"
                         transferContinuity: await this.getContinuity(order), // Example: "I" | "C" | "D" | "A"
                         daysBeforeDueDate: await this.getDays(order), // Example: "15" (Mandatory ONLY if TransferContinuity = "I", range 0-31)
                         routingNumber: "003006959",//order.ccardno.tostring, // Example (Fixed routing number)
-                        accNickname: await this.sanitizeString(order.ccardnameaddr.split("#")[0].trim()).slice(0, 16) + order.ccardno.slice(0, 4),
-                        accType: await this.getAccType(order), //this.getAccType(order) Example: "01" | "11"
+                        accNickname: (await this.sanitizeString(order.ccardnameaddr.split("#")[0].trim())).slice(0, 16) + String(order.ccardno).slice(0, 4),
                         accTitle: order.ccardnameaddr.split("#")[0].trim(),
                         bankName: "BBL", // Example: "BELIZE BANK"
+                        accType: await this.getAccType(order),
                         accNumber: order.fbeaccount,
                         verifyAccountMigration: "Y",
                         requiresVerification: "N"
                       }
-                    //   let transferBody1 = {
-                    //     //bankAccount: "155304010230002",
-                    //     //4916653107949019 nellie, 5255486206517254 sheena, 
-                    //     bankAccount: "137125010230002",
-                    //     cardNumber: "4916653107949019",
-                    //     amount: 0.00,
-                    //     comments: "NEL STANDING ORDER TEST SH .00",
-                    //     transferFrequency: "M",
-                    //     transferContinuity: "I",
-                    //     amountPreference: "M",
-                    //     daysBeforeDueDate: "5",
-                    //     routingNumber: "003006959",
-                    //     accNickname: "NELCARDACC",
-                    //     accType: "11",
-                    //     accNumber: "137125010230002",
-                    //     accTitle: "NELACC",
-                    //     bankName: "BELIZEBANKLTD",
-                    //     verifyAccountMigration: "Y",
-                    //     requiresVerification: "N"
-                    //    }
+
+                      let transferBody1 = {
+                        //bankAccount: "155304010230002",
+                        //4916653107949019 nellie, 5255486206517254 sheena, 
+                        bankAccount: "247672010230000",
+                        cardNumber: "4916653107949019",
+                        amount: 0.00,
+                        comments: "LES-NEL STANDING ORDER TEST SH .00",
+                        transferFrequency: "M",
+                        transferContinuity: "I",
+                        amountPreference: "M",
+                        daysBeforeDueDate: "5",
+                        routingNumber: "003006959",
+                        accNickname: "LES-NELCARDACC",
+                        accType: "11",
+                        accNumber: "247672010230000",
+                        accTitle: "LES-NELACC",
+                        bankName: "BELIZEBANKLTD",
+                        verifyAccountMigration: "Y",
+                        requiresVerification: "N"
+                       }
                     console.log("transferBody :" + JSON.stringify(transferBody));
                     try{
                     let response = await this.sendTransfer(transferBody);
                     return {status:0, message : response}}catch(err)
                     {
-                        logger.error(`Transfers processed so far: ${sent}`);
+                        logger.error(`Error: ${err}`);
                         return {status: 1, message: err}  
                     }
         }
 
     async getFrequency(order: any): Promise<string> {
-
+        logger.info(`ATGETFREQUENCY `);
                     return "M"; //all orders are monthly
     }
 
-    private sanitizeString(str: string): string {
+    async sanitizeString(str: string): Promise<string>  {
         return (str ?? "").replace(/[\s,.:\"']/g, "");
     }
       
     async getAmount(order: any): Promise<number> {
         logger.info(`ATGETAMOUNT order.amount: ${order.amount}, order.fixedamount: ${order.fixedamount}`);
     
-        if (order.amount === "1" && Number(order.fixedamount) >= 0) { // Ensure proper comparison
+        if (order.amount == 1 && Number(order.fixedamount) >= 0) { // Ensure proper comparison
             return Number(order.fixedamount); // Convert to a number before returning
         }
     
@@ -340,10 +339,12 @@ let failedCards: number = 0;
     }
 
     async getContinuity(order: any): Promise<string> {
+        logger.info(`ATGETCONTINUITY `);
         return 'I'; //indefinitely
     }
 
     async getAmtPref(order: any): Promise<string> {
+        logger.info(`ATGETAMTPREF `);
         let pref
         if(order.amount == 1 && order.fixedamount >= 0){
             pref = "F"; //fixed amount
@@ -359,6 +360,7 @@ let failedCards: number = 0;
     }
 
     async getDays(order: any): Promise<string> {
+        logger.info(`ATGETDAYS `);
 
         if(order.frequency == 1)
         {
@@ -376,6 +378,7 @@ let failedCards: number = 0;
     }
 
     async getAccType(order: any): Promise<string> {
+        logger.info(`ATGETACCTYPE `);
         if (order.fbeaccount) {
             const accType = order.fbeaccount.substring(8, 10); // Extracts characters at position 9-10
             if(accType === "01"){return "01"} //checkings
@@ -385,6 +388,7 @@ let failedCards: number = 0;
 
 
     async sendTransfer(body: any): Promise<any> {
+        console.log('reached api upload');
         try {
             const headers = { 
                 "Content-Type": "application/json",
